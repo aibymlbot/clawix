@@ -1,0 +1,490 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// ------------------------------------------------------------------ //
+//  Module mocks — must be hoisted before imports                      //
+// ------------------------------------------------------------------ //
+
+vi.mock('@clawix/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@clawix/shared')>();
+  return {
+    ...actual,
+    createLogger: vi.fn().mockReturnValue({
+      info: vi.fn(),
+      debug: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    }),
+  };
+});
+
+vi.mock('../cron-next-run.js', () => ({
+  computeNextRun: vi.fn().mockReturnValue(new Date('2026-04-01T00:00:00Z')),
+}));
+
+// ------------------------------------------------------------------ //
+//  Imports after mocks                                                //
+// ------------------------------------------------------------------ //
+
+import { CronTaskProcessorService } from '../cron-task-processor.service.js';
+import type { ProcessableTask } from '../cron-task-processor.service.js';
+import { computeNextRun } from '../cron-next-run.js';
+import { PUBSUB_CHANNELS } from '../../cache/cache.constants.js';
+
+// ------------------------------------------------------------------ //
+//  Helpers                                                            //
+// ------------------------------------------------------------------ //
+
+const baseSystemSettings = {
+  cronDefaultTokenBudget: 10000,
+  cronExecutionTimeoutMs: 300000,
+  cronTokenGracePercent: 10,
+  defaultTimezone: 'UTC',
+};
+
+const baseTask: ProcessableTask = {
+  id: 'task-1',
+  agentDefinitionId: 'agent-def-1',
+  createdByUserId: 'user-1',
+  name: 'Test Cron Task',
+  prompt: 'Do something useful',
+  channelId: null,
+  schedule: { type: 'every', interval: '10m' },
+  consecutiveFailures: 0,
+  timeoutMs: null,
+};
+
+const successfulRunResult = {
+  agentRunId: 'run-1',
+  sessionId: 'session-1',
+  output: 'Task completed successfully',
+  status: 'completed' as const,
+  tokenUsage: { inputTokens: 100, outputTokens: 50 },
+};
+
+function makeAgentRunner(overrides: { run?: ReturnType<typeof vi.fn> } = {}) {
+  return {
+    run: overrides.run ?? vi.fn().mockResolvedValue(successfulRunResult),
+  };
+}
+
+function makeTaskRepo() {
+  return {
+    updateLastRun: vi.fn().mockResolvedValue({}),
+    incrementFailures: vi.fn().mockResolvedValue({}),
+    resetFailures: vi.fn().mockResolvedValue({}),
+    autoDisable: vi.fn().mockResolvedValue({}),
+    updateNextRunAt: vi.fn().mockResolvedValue({}),
+  };
+}
+
+function makeTaskRunRepo(overrides: { create?: ReturnType<typeof vi.fn> } = {}) {
+  return {
+    create: overrides.create ?? vi.fn().mockResolvedValue({ id: 'run-1' }),
+    update: vi.fn().mockResolvedValue({}),
+  };
+}
+
+function makeSystemSettingsService(overrides: Partial<typeof baseSystemSettings> = {}) {
+  return {
+    get: vi.fn().mockResolvedValue({ ...baseSystemSettings, ...overrides }),
+  };
+}
+
+function makePolicyRepo(overrides: { findById?: ReturnType<typeof vi.fn> } = {}) {
+  return {
+    findById: overrides.findById ?? vi.fn().mockResolvedValue({ maxTokensPerCronRun: null }),
+  };
+}
+
+function makeUserRepo(overrides: { findById?: ReturnType<typeof vi.fn> } = {}) {
+  return {
+    findById: overrides.findById ?? vi.fn().mockResolvedValue({ policyId: 'policy-1' }),
+  };
+}
+
+function makePubSub() {
+  return {
+    publish: vi.fn().mockResolvedValue(1),
+    subscribe: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+function makeService(
+  options: {
+    agentRunner?: ReturnType<typeof makeAgentRunner>;
+    taskRepo?: ReturnType<typeof makeTaskRepo>;
+    taskRunRepo?: ReturnType<typeof makeTaskRunRepo>;
+    systemSettingsService?: ReturnType<typeof makeSystemSettingsService>;
+    policyRepo?: ReturnType<typeof makePolicyRepo>;
+    userRepo?: ReturnType<typeof makeUserRepo>;
+    pubsub?: ReturnType<typeof makePubSub>;
+  } = {},
+) {
+  const agentRunner = options.agentRunner ?? makeAgentRunner();
+  const taskRepo = options.taskRepo ?? makeTaskRepo();
+  const taskRunRepo = options.taskRunRepo ?? makeTaskRunRepo();
+  const systemSettingsService = options.systemSettingsService ?? makeSystemSettingsService();
+  const policyRepo = options.policyRepo ?? makePolicyRepo();
+  const userRepo = options.userRepo ?? makeUserRepo();
+  const pubsub = options.pubsub ?? makePubSub();
+
+  const service = new CronTaskProcessorService(
+    agentRunner as never,
+    taskRepo as never,
+    taskRunRepo as never,
+    systemSettingsService as never,
+    policyRepo as never,
+    userRepo as never,
+    pubsub as never,
+  );
+
+  return {
+    service,
+    agentRunner,
+    taskRepo,
+    taskRunRepo,
+    systemSettingsService,
+    policyRepo,
+    userRepo,
+    pubsub,
+  };
+}
+
+// ------------------------------------------------------------------ //
+//  Tests                                                             //
+// ------------------------------------------------------------------ //
+
+describe('CronTaskProcessorService.execute', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('creates a TaskRun record with status running before invoking agent runner', async () => {
+    const { service, taskRunRepo } = makeService();
+
+    await service.execute(baseTask);
+
+    expect(taskRunRepo.create).toHaveBeenCalledWith({
+      taskId: 'task-1',
+      status: 'running',
+    });
+  });
+
+  it('invokes agent runner with isScheduledTask: true and correct parameters', async () => {
+    const { service, agentRunner } = makeService();
+
+    await service.execute(baseTask);
+
+    expect(agentRunner.run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentDefinitionId: 'agent-def-1',
+        userId: 'user-1',
+        input: 'Do something useful',
+        isScheduledTask: true,
+        channel: 'internal',
+        chatId: 'cron:task-1',
+        userName: 'CronScheduler',
+      }),
+    );
+  });
+
+  it('updates TaskRun as completed with output and token usage on success', async () => {
+    const { service, taskRunRepo } = makeService();
+
+    await service.execute(baseTask);
+
+    expect(taskRunRepo.update).toHaveBeenCalledWith(
+      'run-1',
+      expect.objectContaining({
+        status: 'completed',
+        output: 'Task completed successfully',
+        tokenUsage: { inputTokens: 100, outputTokens: 50 },
+      }),
+    );
+  });
+
+  it('resets consecutive failures on success', async () => {
+    const { service, taskRepo } = makeService();
+
+    await service.execute(baseTask);
+
+    expect(taskRepo.resetFailures).toHaveBeenCalledWith('task-1');
+  });
+
+  it('updates lastRun with completed status on success', async () => {
+    const { service, taskRepo } = makeService();
+
+    await service.execute(baseTask);
+
+    expect(taskRepo.updateLastRun).toHaveBeenCalledWith('task-1', 'completed', expect.any(Date));
+  });
+
+  it('computes and sets nextRunAt on success', async () => {
+    const { service, taskRepo } = makeService();
+    const expectedNextRun = new Date('2026-04-01T00:00:00Z');
+
+    await service.execute(baseTask);
+
+    expect(computeNextRun).toHaveBeenCalledWith(baseTask.schedule);
+    expect(taskRepo.updateNextRunAt).toHaveBeenCalledWith('task-1', expectedNextRun);
+  });
+
+  it('increments consecutive failures on error', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('agent crashed')),
+    });
+    const { service, taskRepo } = makeService({ agentRunner });
+
+    await service.execute(baseTask);
+
+    expect(taskRepo.incrementFailures).toHaveBeenCalledWith('task-1');
+  });
+
+  it('updates TaskRun as failed with error message on error', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('something broke')),
+    });
+    const { service, taskRunRepo } = makeService({ agentRunner });
+
+    await service.execute(baseTask);
+
+    expect(taskRunRepo.update).toHaveBeenCalledWith(
+      'run-1',
+      expect.objectContaining({
+        status: 'failed',
+        error: 'something broke',
+      }),
+    );
+  });
+
+  it('updates lastRun with failed status on error', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('oops')),
+    });
+    const { service, taskRepo } = makeService({ agentRunner });
+
+    await service.execute(baseTask);
+
+    expect(taskRepo.updateLastRun).toHaveBeenCalledWith('task-1', 'failed', expect.any(Date));
+  });
+
+  it('computes nextRunAt on failure when not auto-disabled', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('oops')),
+    });
+    const task = { ...baseTask, consecutiveFailures: 0 }; // 0+1=1, below MAX=3
+    const { service, taskRepo } = makeService({ agentRunner });
+
+    await service.execute(task);
+
+    expect(taskRepo.updateNextRunAt).toHaveBeenCalledWith('task-1', expect.any(Date));
+    expect(taskRepo.autoDisable).not.toHaveBeenCalled();
+  });
+
+  it('auto-disables after max consecutive failures (consecutiveFailures=2, +1=3>=MAX=3)', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('failed again')),
+    });
+    const task: ProcessableTask = { ...baseTask, consecutiveFailures: 2 };
+    const { service, taskRepo } = makeService({ agentRunner });
+
+    await service.execute(task);
+
+    expect(taskRepo.autoDisable).toHaveBeenCalledWith('task-1', 'auto:max_failures');
+  });
+
+  it('does NOT compute nextRunAt when auto-disabled', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('failed')),
+    });
+    const task: ProcessableTask = { ...baseTask, consecutiveFailures: 2 };
+    const { service, taskRepo } = makeService({ agentRunner });
+
+    await service.execute(task);
+
+    expect(taskRepo.updateNextRunAt).not.toHaveBeenCalled();
+  });
+
+  it('does not auto-disable when consecutiveFailures is below threshold (1+1=2 < 3)', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('fail')),
+    });
+    const task: ProcessableTask = { ...baseTask, consecutiveFailures: 1 };
+    const { service, taskRepo } = makeService({ agentRunner });
+
+    await service.execute(task);
+
+    expect(taskRepo.autoDisable).not.toHaveBeenCalled();
+  });
+
+  it('handles execution timeout — rejects and records as failed', async () => {
+    // Use a short timeout and a slow agent runner
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockImplementation(() => new Promise((resolve) => setTimeout(resolve, 5000))),
+    });
+    const systemSettingsService = makeSystemSettingsService({
+      cronExecutionTimeoutMs: 50,
+    });
+    // Also ensure CRON_MAX_TIMEOUT_MS doesn't cap below our test timeout
+    const originalEnv = process.env['CRON_MAX_TIMEOUT_MS'];
+    process.env['CRON_MAX_TIMEOUT_MS'] = '900000';
+
+    const { service, taskRunRepo } = makeService({ agentRunner, systemSettingsService });
+
+    await service.execute(baseTask);
+
+    expect(taskRunRepo.update).toHaveBeenCalledWith(
+      'run-1',
+      expect.objectContaining({
+        status: 'failed',
+        error: 'execution_timeout',
+      }),
+    );
+
+    process.env['CRON_MAX_TIMEOUT_MS'] = originalEnv;
+  }, 10000);
+
+  it('uses task.timeoutMs when set, overriding system settings', async () => {
+    // task.timeoutMs=50ms should override system default of 300000ms
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockImplementation(() => new Promise((resolve) => setTimeout(resolve, 5000))),
+    });
+    const task: ProcessableTask = { ...baseTask, timeoutMs: 50 };
+    const { service, taskRunRepo } = makeService({ agentRunner });
+
+    await service.execute(task);
+
+    expect(taskRunRepo.update).toHaveBeenCalledWith(
+      'run-1',
+      expect.objectContaining({
+        status: 'failed',
+        error: 'execution_timeout',
+      }),
+    );
+  }, 10000);
+
+  it('handles null output from agent runner gracefully', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockResolvedValue({
+        ...successfulRunResult,
+        output: null,
+      }),
+    });
+    const { service, taskRunRepo } = makeService({ agentRunner });
+
+    await service.execute(baseTask);
+
+    expect(taskRunRepo.update).toHaveBeenCalledWith(
+      'run-1',
+      expect.objectContaining({
+        status: 'completed',
+        output: undefined,
+      }),
+    );
+  });
+
+  it('passes tokenBudget from policy to agentRunner.run', async () => {
+    const policyRepo = makePolicyRepo({
+      findById: vi.fn().mockResolvedValue({ maxTokensPerCronRun: 5000 }),
+    });
+    const { service, agentRunner } = makeService({ policyRepo });
+
+    await service.execute(baseTask);
+
+    expect(agentRunner.run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tokenBudget: 5000,
+        tokenGracePercent: 10,
+      }),
+    );
+  });
+
+  it('uses system default when policy has no maxTokensPerCronRun', async () => {
+    const policyRepo = makePolicyRepo({
+      findById: vi.fn().mockResolvedValue({ maxTokensPerCronRun: null }),
+    });
+    const { service, agentRunner } = makeService({ policyRepo });
+
+    await service.execute(baseTask);
+
+    expect(agentRunner.run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tokenBudget: 10000,
+      }),
+    );
+  });
+
+  it('publishes cronResultReady when task has a channelId and run succeeds', async () => {
+    const task: ProcessableTask = { ...baseTask, channelId: 'channel-uuid-1' };
+    const { service, pubsub } = makeService();
+
+    await service.execute(task);
+
+    expect(pubsub.publish).toHaveBeenCalledWith(
+      PUBSUB_CHANNELS.cronResultReady,
+      expect.objectContaining({
+        channelId: 'channel-uuid-1',
+        userId: 'user-1',
+        taskId: 'task-1',
+        taskName: 'Test Cron Task',
+        output: 'Task completed successfully',
+      }),
+    );
+  });
+
+  it('does not publish cronResultReady when task has no channelId', async () => {
+    const { service, pubsub } = makeService();
+
+    await service.execute(baseTask); // baseTask.channelId is null
+
+    expect(pubsub.publish).not.toHaveBeenCalled();
+  });
+
+  it('does not publish cronResultReady when agent output is null', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockResolvedValue({ ...successfulRunResult, output: null }),
+    });
+    const task: ProcessableTask = { ...baseTask, channelId: 'channel-uuid-1' };
+    const { service, pubsub } = makeService({ agentRunner });
+
+    await service.execute(task);
+
+    expect(pubsub.publish).not.toHaveBeenCalled();
+  });
+
+  it('does not publish cronResultReady on failure', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockRejectedValue(new Error('agent crashed')),
+    });
+    const task: ProcessableTask = { ...baseTask, channelId: 'channel-uuid-1' };
+    const { service, pubsub } = makeService({ agentRunner });
+
+    await service.execute(task);
+
+    expect(pubsub.publish).not.toHaveBeenCalled();
+  });
+
+  it('treats token_budget_exceeded as failure', async () => {
+    const agentRunner = makeAgentRunner({
+      run: vi.fn().mockResolvedValue({
+        agentRunId: 'run-1',
+        sessionId: 'session-1',
+        output: 'partial output',
+        status: 'failed',
+        error: 'token_budget_exceeded',
+        tokenUsage: {
+          inputTokens: 5000,
+          outputTokens: 5000,
+          totalTokens: 10000,
+          model: 'test',
+          estimatedCostUsd: 0,
+        },
+      }),
+    });
+    const { service, taskRepo } = makeService({ agentRunner });
+
+    await service.execute(baseTask);
+
+    expect(taskRepo.incrementFailures).toHaveBeenCalledWith('task-1');
+  });
+});

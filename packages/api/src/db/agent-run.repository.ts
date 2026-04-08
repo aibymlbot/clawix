@@ -1,0 +1,171 @@
+import { Injectable } from '@nestjs/common';
+import { NotFoundError } from '@clawix/shared';
+
+import type { PaginatedResponse, PaginationInput } from '@clawix/shared';
+import type { AgentRunModel } from '../generated/prisma/models.js';
+import type { Prisma } from '../generated/prisma/client.js';
+import type { AgentStatus } from '../generated/prisma/enums.js';
+
+import { PrismaService } from '../prisma/prisma.service.js';
+import { buildPaginatedResponse, buildPaginationArgs, handlePrismaError } from './utils.js';
+
+type AgentRun = AgentRunModel;
+
+interface CreateAgentRunInput {
+  readonly agentDefinitionId: string;
+  readonly sessionId: string;
+  readonly input: string;
+  readonly status?: AgentStatus;
+  readonly parentAgentRunId?: string;
+}
+
+interface UpdateAgentRunInput {
+  readonly status?: AgentStatus;
+  readonly sessionId?: string;
+  readonly output?: string;
+  readonly error?: string;
+  readonly tokenUsage?: Prisma.InputJsonValue;
+  readonly completedAt?: Date;
+}
+
+@Injectable()
+export class AgentRunRepository {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async findById(id: string): Promise<AgentRun> {
+    const agentRun = await this.prisma.agentRun.findUnique({ where: { id } });
+
+    if (!agentRun) {
+      throw new NotFoundError('AgentRun', id);
+    }
+
+    return agentRun;
+  }
+
+  async findAll(pagination: PaginationInput): Promise<PaginatedResponse<AgentRun>> {
+    const paginationArgs = buildPaginationArgs(pagination);
+
+    const [data, total] = await Promise.all([
+      this.prisma.agentRun.findMany({
+        ...paginationArgs,
+        orderBy: { startedAt: 'desc' },
+      }),
+      this.prisma.agentRun.count(),
+    ]);
+
+    return buildPaginatedResponse(data, total, pagination);
+  }
+
+  async findByStatus(
+    status: AgentStatus,
+    pagination: PaginationInput,
+  ): Promise<PaginatedResponse<AgentRun>> {
+    const paginationArgs = buildPaginationArgs(pagination);
+    const where = { status };
+
+    const [data, total] = await Promise.all([
+      this.prisma.agentRun.findMany({
+        where,
+        ...paginationArgs,
+        orderBy: { startedAt: 'desc' },
+      }),
+      this.prisma.agentRun.count({ where }),
+    ]);
+
+    return buildPaginatedResponse(data, total, pagination);
+  }
+
+  async findBySessionId(
+    sessionId: string,
+    pagination: PaginationInput,
+  ): Promise<PaginatedResponse<AgentRun>> {
+    const paginationArgs = buildPaginationArgs(pagination);
+    const where = { sessionId };
+
+    const [data, total] = await Promise.all([
+      this.prisma.agentRun.findMany({
+        where,
+        ...paginationArgs,
+        orderBy: { startedAt: 'desc' },
+      }),
+      this.prisma.agentRun.count({ where }),
+    ]);
+
+    return buildPaginatedResponse(data, total, pagination);
+  }
+
+  async findByAgentDefinitionId(
+    agentDefinitionId: string,
+    pagination: PaginationInput,
+  ): Promise<PaginatedResponse<AgentRun>> {
+    const paginationArgs = buildPaginationArgs(pagination);
+    const where = { agentDefinitionId };
+
+    const [data, total] = await Promise.all([
+      this.prisma.agentRun.findMany({
+        where,
+        ...paginationArgs,
+        orderBy: { startedAt: 'desc' },
+      }),
+      this.prisma.agentRun.count({ where }),
+    ]);
+
+    return buildPaginatedResponse(data, total, pagination);
+  }
+
+  async findAllByStatus(status: AgentStatus): Promise<readonly AgentRun[]> {
+    return this.prisma.agentRun.findMany({
+      where: { status },
+      orderBy: { startedAt: 'asc' },
+    });
+  }
+
+  async create(data: CreateAgentRunInput): Promise<AgentRun> {
+    try {
+      return await this.prisma.agentRun.create({
+        data: {
+          agentDefinitionId: data.agentDefinitionId,
+          sessionId: data.sessionId,
+          input: data.input,
+          ...(data.status ? { status: data.status } : {}),
+          ...(data.parentAgentRunId ? { parentAgentRunId: data.parentAgentRunId } : {}),
+        },
+      });
+    } catch (error: unknown) {
+      handlePrismaError(error, 'AgentRun');
+    }
+  }
+
+  async findByParentId(parentAgentRunId: string): Promise<readonly AgentRun[]> {
+    return this.prisma.agentRun.findMany({
+      where: { parentAgentRunId },
+      orderBy: { startedAt: 'asc' },
+    });
+  }
+
+  async update(id: string, data: UpdateAgentRunInput): Promise<AgentRun> {
+    try {
+      return await this.prisma.agentRun.update({
+        where: { id },
+        data: {
+          ...(data.status ? { status: data.status } : {}),
+          ...(data.sessionId !== undefined ? { sessionId: data.sessionId } : {}),
+          ...(data.output !== undefined ? { output: data.output } : {}),
+          ...(data.error !== undefined ? { error: data.error } : {}),
+          ...(data.tokenUsage !== undefined ? { tokenUsage: data.tokenUsage } : {}),
+          ...(data.completedAt !== undefined ? { completedAt: data.completedAt } : {}),
+        },
+      });
+    } catch (error: unknown) {
+      handlePrismaError(error, 'AgentRun');
+    }
+  }
+
+  async delete(id: string): Promise<AgentRun> {
+    try {
+      return await this.prisma.agentRun.delete({ where: { id } });
+    } catch (error: unknown) {
+      handlePrismaError(error, 'AgentRun');
+    }
+  }
+}

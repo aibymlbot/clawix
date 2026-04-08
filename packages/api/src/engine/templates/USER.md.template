@@ -1,0 +1,19 @@
+# User Profile
+
+## Basic Info
+- **Name**: {{ user.name }}
+- **Timezone**: (learned from conversations)
+- **Language**: (preferred language)
+
+## Preferences
+- **Communication Style**: (learned from conversations)
+- **Response Length**: (learned from conversations)
+- **Technical Level**: (learned from conversations)
+
+## Work Context
+- **Role**: (learned from conversations)
+- **Projects**: (learned from conversations)
+- **Tools**: (learned from conversations)
+
+## Special Instructions
+(User-specific notes and preferences learned over time)

@@ -1,0 +1,443 @@
+// ============================================================================
+// Clawix — Prisma Schema
+// Phase 1: Data Layer
+// Single-org design: Policy (governance) + Group (collaboration) + Role (authz)
+// ============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// Policy (governance tier — quotas, limits, feature access)
+// ============================================================================
+
+model Policy {
+  id               String   @id @default(cuid())
+  name             String   @unique // "Free", "Pro", "Enterprise"
+  description      String?
+  maxTokenBudget   Int? // monthly budget in USD cents (null = unlimited)
+  maxAgents        Int      @default(5)
+  maxSkills        Int      @default(10)
+  maxMemoryItems   Int      @default(1000)
+  maxGroupsOwned   Int      @default(5)
+  allowedProviders     String[] // ["anthropic", "openai"]
+  features             Json     @default("{}") // feature flags
+  maxScheduledTasks    Int      @default(5)
+  minCronIntervalSecs  Int      @default(300)
+  maxTokensPerCronRun  Int?
+  cronEnabled          Boolean  @default(false)
+  isActive             Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  users User[]
+}
+
+// ============================================================================
+// User
+// ============================================================================
+
+enum UserRole {
+  admin
+  developer
+  viewer
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         UserRole @default(viewer)
+  policyId     String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  telegramId   String?  @unique
+
+  policy        Policy         @relation(fields: [policyId], references: [id])
+  sessions      Session[]
+  auditLogs     AuditLog[]
+  memoryItems   MemoryItem[]
+  groupMembers  GroupMember[]
+  notifications Notification[]
+  userAgents    UserAgent[]
+  tasks         Task[]
+  createdAgentDefinitions AgentDefinition[] @relation("CreatedAgentDefinitions")
+}
+
+// ============================================================================
+// Agent Definitions & Runs
+// ============================================================================
+
+enum AgentRole {
+  primary
+  worker
+}
+
+model AgentDefinition {
+  id              String    @id @default(cuid())
+  name            String
+  description     String?
+  systemPrompt    String    @default("")
+  role            AgentRole @default(primary)
+  provider        String    @default("anthropic")
+  model           String    @default("claude-sonnet-4-20250514")
+  apiBaseUrl      String? // for custom/self-hosted endpoints
+  skillIds        String[] // references to Skill.id
+  maxTokensPerRun Int       @default(100000)
+  containerConfig Json      @default("{}")
+  isActive        Boolean   @default(true)
+  isOfficial      Boolean   @default(true)
+  createdById     String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  agentRuns  AgentRun[]
+  sessions   Session[]
+  userAgents UserAgent[]
+  tasks      Task[]
+  createdBy  User?        @relation("CreatedAgentDefinitions", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([isActive])
+  @@index([role, isActive])
+  @@index([createdById])
+}
+
+enum AgentStatus {
+  pending
+  idle
+  running
+  completed
+  failed
+  cancelled
+}
+
+model AgentRun {
+  id                String      @id @default(cuid())
+  agentDefinitionId String
+  sessionId         String
+  status            AgentStatus @default(idle)
+  input             String
+  output            String?
+  error             String?
+  tokenUsage        Json        @default("{}") // TokenUsageRecord
+  startedAt         DateTime    @default(now())
+  completedAt       DateTime?
+  parentAgentRunId  String?     @map("parent_agent_run_id")
+
+  agentDefinition AgentDefinition @relation(fields: [agentDefinitionId], references: [id], onDelete: Cascade)
+  session         Session         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  parentRun       AgentRun?       @relation("SubAgentRuns", fields: [parentAgentRunId], references: [id])
+  childRuns       AgentRun[]      @relation("SubAgentRuns")
+
+  @@index([agentDefinitionId])
+  @@index([sessionId])
+  @@index([status])
+  @@index([parentAgentRunId])
+}
+
+// ============================================================================
+// User Agent (per-user primary agent binding)
+// ============================================================================
+
+model UserAgent {
+  id                String   @id @default(cuid())
+  userId            String
+  agentDefinitionId String
+  workspacePath     String // relative: users/{userId}/workspace
+  lastSessionId     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentDefinition AgentDefinition @relation(fields: [agentDefinitionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, agentDefinitionId])
+}
+
+// ============================================================================
+// Provider Configuration (org-level, one per provider)
+// ============================================================================
+
+model ProviderConfig {
+  id          String   @id @default(cuid())
+  provider    String   @unique // "anthropic", "openai", "zai-coding", "custom-xxx"
+  displayName String             // "Anthropic", "OpenAI", "Z.AI Coding Plan"
+  apiKey      String             // encrypted at rest (AES-256-GCM)
+  apiBaseUrl  String?            // override endpoint
+  isEnabled   Boolean  @default(true)
+  isDefault   Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ============================================================================
+// Channels & Messages
+// ============================================================================
+
+enum ChannelType {
+  whatsapp
+  slack
+  web
+  telegram
+}
+
+model Channel {
+  id        String      @id @default(cuid())
+  type      ChannelType
+  name      String
+  config    Json        @default("{}") // channel-specific configuration
+  isActive  Boolean     @default(true)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  sessions Session[]
+  tasks    Task[]
+
+  @@index([type])
+}
+
+// ============================================================================
+// Tasks (Scheduled / Cron)
+// ============================================================================
+
+enum TaskStatus {
+  pending
+  running
+  completed
+  failed
+  cancelled
+}
+
+model Task {
+  id                   String      @id @default(cuid())
+  agentDefinitionId    String
+  name                 String
+  schedule             Json // CronSchedule: { type, time/interval/expression }
+  prompt               String
+  channelId            String? // optional: deliver output to a channel
+  enabled              Boolean     @default(true)
+  lastRunAt            DateTime?
+  lastStatus           TaskStatus?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+  createdByUserId      String?
+  nextRunAt            DateTime?
+  consecutiveFailures  Int         @default(0)
+  disabledReason       String?
+  timeoutMs            Int?
+
+  agentDefinition AgentDefinition @relation(fields: [agentDefinitionId], references: [id], onDelete: Cascade)
+  channel         Channel?        @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  taskRuns        TaskRun[]
+  createdByUser   User?           @relation(fields: [createdByUserId], references: [id])
+
+  @@index([enabled, nextRunAt])
+}
+
+model TaskRun {
+  id          String     @id @default(cuid())
+  taskId      String
+  status      TaskStatus @default(pending)
+  output      String?
+  error       String?
+  tokenUsage  Json       @default("{}") // { inputTokens, outputTokens }
+  startedAt   DateTime   @default(now())
+  completedAt DateTime?
+  durationMs  Int?
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@index([taskId, startedAt])
+}
+
+// ============================================================================
+// Sessions
+// ============================================================================
+
+model Session {
+  id                 String    @id @default(cuid())
+  userId             String
+  agentDefinitionId  String
+  channelId          String?
+  lastConsolidatedAt DateTime? // memory consolidation pointer
+  isActive           Boolean   @default(true)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentDefinition AgentDefinition @relation(fields: [agentDefinitionId], references: [id], onDelete: Cascade)
+  channel         Channel?        @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  agentRuns       AgentRun[]
+  sessionMessages SessionMessage[]
+
+  @@index([userId])
+  @@index([userId, isActive])
+}
+
+model SessionMessage {
+  id         String    @id @default(cuid())
+  sessionId  String
+  senderId   String?
+  role       String
+  content    String    @db.Text
+  toolCallId String?
+  toolCalls  Json?
+  ordering   Int
+  createdAt  DateTime  @default(now())
+  archivedAt DateTime?
+
+  session    Session   @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, ordering])
+  @@index([sessionId, archivedAt])
+}
+
+// ============================================================================
+// Governance — Audit Logs & Token Usage
+// ============================================================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String
+  action     String // e.g. "memory.share", "agent.run", "skill.approve"
+  resource   String // e.g. "MemoryItem", "AgentRun", "Skill"
+  resourceId String
+  details    Json     @default("{}") // action-specific context
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Append-only: no update/delete routes exist for this model
+  @@index([action])
+  @@index([resource, resourceId])
+  @@index([createdAt])
+}
+
+model TokenUsage {
+  id               String   @id @default(cuid())
+  agentRunId       String
+  userId           String // for policy-level budget enforcement
+  model            String
+  inputTokens      Int
+  outputTokens     Int
+  totalTokens      Int
+  estimatedCostUsd Float    @default(0)
+  createdAt        DateTime @default(now())
+
+  @@index([userId])
+  @@index([model])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// Memory System — Groups, Items, Shares, Notifications
+// ============================================================================
+
+model Group {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  createdById String
+  createdAt   DateTime @default(now())
+
+  members GroupMember[]
+  shares  MemoryShare[]
+}
+
+enum GroupMemberRole {
+  OWNER
+  MEMBER
+}
+
+model GroupMember {
+  groupId  String
+  userId   String
+  role     GroupMemberRole @default(MEMBER)
+  joinedAt DateTime        @default(now())
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([groupId, userId])
+  @@index([userId])
+}
+
+model MemoryItem {
+  id        String   @id @default(cuid())
+  ownerId   String
+  content   Json // structured memory content
+  tags      String[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner  User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  shares MemoryShare[]
+
+  @@index([ownerId])
+}
+
+enum ShareTarget {
+  GROUP
+  ORG
+}
+
+model MemoryShare {
+  id           String      @id @default(cuid())
+  memoryItemId String
+  sharedBy     String // userId who initiated the share
+  targetType   ShareTarget
+  groupId      String? // set if targetType = GROUP
+  sharedAt     DateTime    @default(now())
+  revokedAt    DateTime?
+  isRevoked    Boolean     @default(false)
+
+  memoryItem MemoryItem @relation(fields: [memoryItemId], references: [id], onDelete: Cascade)
+  group      Group?     @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([memoryItemId, isRevoked])
+  @@index([groupId, isRevoked])
+}
+
+enum NotificationType {
+  MEMORY_SHARED
+  MEMORY_REVOKED
+  GROUP_INVITE
+}
+
+model Notification {
+  id          String           @id @default(cuid())
+  recipientId String
+  type        NotificationType
+  payload     Json // { memoryItemId, shareId, sharedBy, groupId, ... }
+  isRead      Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+
+  recipient User @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId])
+  @@index([recipientId, isRead])
+}
+
+// ============================================================================
+// System Settings (single-row, JSON + Zod)
+// ============================================================================
+
+model SystemSettings {
+  id        String   @id @default("default")
+  name      String   @default("Clawix")
+  slug      String   @unique @default("clawix")
+  settings  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
