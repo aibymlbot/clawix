@@ -82,31 +82,31 @@ Pluggable tools with approval workflows. Bundle built-in skills, create custom o
                         └──────────────────┬───────────────────────┘
                                            │
                         ┌──────────────────▼───────────────────────┐
-                        │             API Gateway                   │
-                        │   NestJS + Fastify  │  JWT  │  Rate Limit │
+                        │             API Gateway                  │
+                        │   NestJS + Fastify  │  JWT  │ Rate Limit │
                         └──────────────────┬───────────────────────┘
                                            │
               ┌────────────────────────────▼────────────────────────────┐
               │                     Core Engine                         │
               │                                                         │
-              │  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
-              │  │  Reasoning  │  │    Tool       │  │    Swarm      │  │
-              │  │   Loops     │  │  Execution    │  │ Coordinator   │  │
-              │  └─────────────┘  └──────────────┘  └───────────────┘  │
+              │  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐   │
+              │  │  Reasoning  │  │    Tool       │  │    Swarm     │   │
+              │  │   Loops     │  │  Execution    │  │ Coordinator  │   │
+              │  └─────────────┘  └──────────────┘  └───────────────┘   │
               │                                                         │
               │  Providers: Claude │ GPT │ OpenAI-compatible │ Custom   │
-              └────────────────────────────┬───────────────────────────┘
+              └────────────────────────────┬───────────────────────────-┘
                                            │
-              ┌────────────────────────────▼────────────────────────────┐
-              │                  Container Pool                         │
+              ┌────────────────────────────▼───────────────────────────┐
+              │                  Container Pool                        │
               │  ┌──────────┐  ┌──────────────┐  ┌─────────────────┐   │
-              │  │  Warm     │  │  Ephemeral   │  │  Resource       │   │
-              │  │  Primary  │  │  Sub-Agents  │  │  Limits         │   │
+              │  │  Warm     │  │  Ephemeral   │  │  Resource      │   │
+              │  │  Primary  │  │  Sub-Agents  │  │  Limits        │   │
               │  └──────────┘  └──────────────┘  └─────────────────┘   │
               └────────────────────────────┬───────────────────────────┘
                                            │
               ┌────────────────────────────▼────────────────────────────┐
-              │                    Data Layer                            │
+              │                    Data Layer                           │
               │        PostgreSQL  │  Redis  │  User Workspaces         │
               └─────────────────────────────────────────────────────────┘
 ```
@@ -180,7 +180,7 @@ Built-in providers plus extensible registry -- add new ones with a single `Provi
 | Provider       | Detection                       | Use Case               | Status         |
 | -------------- | ------------------------------- | ---------------------- | -------------- |
 | **Anthropic**  | model starts with `claude-`     | Primary (best tools)   | Available      |
-| **OpenAI**     | model starts with `gpt-`/`o1-`/`o3-`/`o4-` | General purpose | Available |
+| **OpenAI**     | model starts with `gpt-`/`o1-`/`o3-`/`o4-` | General purpose | Available  |
 | **Z.AI Coding**| model starts with `glm-`        | GLM models             | Available      |
 | **Azure**      | config key `azure_openai`       | Enterprise compliance  | Planned        |
 | **DeepSeek**   | model starts with `deepseek-`   | Cost-effective         | Planned        |
@@ -211,7 +211,7 @@ Clawix follows a **zero-trust architecture** for agent execution:
 | Memory poisoning               | Agent context regenerated from DB each run                     |
 | Disk exhaustion                | Per-user quota enforcement (default 500 MB)                    |
 | Path traversal                 | All paths validated to stay under `data/org/`                  |
-| Secret leakage                 | API keys encrypted at rest (AES-256-GCM)                      |
+| Secret leakage                 | API keys encrypted at rest (AES-256-GCM)                       |
 | Untrusted code execution       | All agent code runs inside sandboxed containers, never on host |
 
 ---
